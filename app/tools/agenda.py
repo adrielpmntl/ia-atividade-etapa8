@@ -8,6 +8,7 @@ from langchain.tools import tool
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 
+from app.escritas_pendentes import adiar_escrita
 from app.memory import get_db
 
 _indice_criado = False
@@ -80,7 +81,9 @@ def criar_evento(
         "status": "ativo",
         "criado_em": datetime.now(timezone.utc),
     }
-    col_eventos.insert_one(evento)
+    # O MongoDB local não tem transação: a escrita só acontece depois do
+    # veredito do juiz (app/escritas_pendentes.py).
+    adiar_escrita(config, lambda: col_eventos.insert_one(evento))
     return {"status": "ok", "evento": evento}
 
 
@@ -146,13 +149,12 @@ def atualizar_evento(
     if not alteracoes:
         return {"status": "error", "message": "Nenhuma alteração informada."}
     col_eventos = _get_col_eventos()
-    resultado = col_eventos.update_one(
-        {"_id": evento_id, "user_id": user_id, "status": "ativo"},
-        {"$set": alteracoes},
-    )
-    if not resultado.matched_count:
+    filtro = {"_id": evento_id, "user_id": user_id, "status": "ativo"}
+    evento = col_eventos.find_one(filtro)
+    if not evento:
         return {"status": "error", "message": "Evento não encontrado."}
-    return {"status": "ok", "evento": col_eventos.find_one({"_id": evento_id})}
+    adiar_escrita(config, lambda: col_eventos.update_one(filtro, {"$set": alteracoes}))
+    return {"status": "ok", "evento": {**evento, **alteracoes}}
 
 
 class CancelarEventoArgs(BaseModel):
@@ -165,12 +167,12 @@ def cancelar_evento(evento_id: str, config: RunnableConfig) -> dict:
     user_id = _user_id(config)
     if not user_id:
         return {"status": "error", "message": "Usuário não identificado."}
-    resultado = _get_col_eventos().update_one(
-        {"_id": evento_id, "user_id": user_id, "status": "ativo"},
-        {"$set": {"status": "cancelado", "cancelado_em": datetime.now(timezone.utc)}},
-    )
-    if not resultado.matched_count:
+    col_eventos = _get_col_eventos()
+    filtro = {"_id": evento_id, "user_id": user_id, "status": "ativo"}
+    if not col_eventos.find_one(filtro):
         return {"status": "error", "message": "Evento não encontrado."}
+    cancelamento = {"status": "cancelado", "cancelado_em": datetime.now(timezone.utc)}
+    adiar_escrita(config, lambda: col_eventos.update_one(filtro, {"$set": cancelamento}))
     return {"status": "ok", "evento_id": evento_id}
 
 

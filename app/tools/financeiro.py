@@ -1,9 +1,11 @@
 import re
 
 from langchain.tools import tool
+from langchain_core.runnables import RunnableConfig
 from typing import List, Optional
 from pydantic import BaseModel, Field
 
+from app.escritas_pendentes import adiar_commit
 from app.tools.db import get_conn
 from app.tools.perfil import consultar_perfil_financeiro
 
@@ -163,6 +165,7 @@ def _resolve_category_id(
 def add_transaction(
     amount: float,
     source_text: str,
+    config: RunnableConfig,
     occurred_at: Optional[str] = None,
     type_id: Optional[int] = None,
     type_name: Optional[str] = None,
@@ -179,6 +182,7 @@ def add_transaction(
     except Exception as exc:
         return {"status": "error", "message": f"PostgreSQL indisponível: {exc}"}
 
+    aguardando_veredito = False
     try:
         resolved_type_id = _resolve_type_id(cur, type_id, type_name)
         if not resolved_type_id:
@@ -225,7 +229,8 @@ def add_transaction(
             )
 
         new_id, occurred = cur.fetchone()
-        conn.commit()
+        # O commit espera o veredito do juiz (app/escritas_pendentes.py).
+        aguardando_veredito = adiar_commit(config, conn)
 
         return {
             "status": "ok",
@@ -240,7 +245,8 @@ def add_transaction(
     finally:
         try:
             cur.close()
-            conn.close()
+            if not aguardando_veredito:
+                conn.close()
         except Exception:
             pass
         
@@ -421,6 +427,7 @@ class UpdateTransactionArgs(BaseModel):
 
 @tool("update_transaction", args_schema=UpdateTransactionArgs)
 def update_transaction(
+    config: RunnableConfig,
     id: Optional[int] = None,
     match_text: Optional[str] = None,
     date_local: Optional[str] = None,
@@ -446,6 +453,7 @@ def update_transaction(
 
     conn = get_conn()
     cur = conn.cursor()
+    aguardando_veredito = False
     try:
         # Resolve target_id
         target_id = id
@@ -505,14 +513,16 @@ def update_transaction(
 
         params.append(target_id)
 
+        # Uma escrita pendente segura a linha até o veredito do turno dela.
+        # Sem limite, um segundo UPDATE na mesma linha esperaria para sempre.
+        cur.execute("SET LOCAL lock_timeout = '5s';")
         cur.execute(
             f"UPDATE transactions SET {', '.join(sets)} WHERE id = %s;",
             params
         )
         rows_affected = cur.rowcount
-        conn.commit()
 
-        # Retornar o registro atualizado
+        # Retornar o registro atualizado (a mesma transação já enxerga o UPDATE)
         cur.execute(
             """
             SELECT
@@ -539,6 +549,9 @@ def update_transaction(
                 "source_text": r[7],
             }
 
+        # O commit espera o veredito do juiz (app/escritas_pendentes.py).
+        aguardando_veredito = adiar_commit(config, conn)
+
         return {
             "status": "ok",
             "rows_affected": rows_affected,
@@ -552,7 +565,8 @@ def update_transaction(
     finally:
         try:
             cur.close()
-            conn.close()
+            if not aguardando_veredito:
+                conn.close()
         except Exception:
             pass
 
