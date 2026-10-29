@@ -8,6 +8,7 @@ from langchain.agents import create_agent
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, MessagesState, StateGraph
+from app.escritas_pendentes import FRASE_ESCRITA_DESFEITA, confirmar_escritas, descartar_escritas
 from app.memory import salvar_mensagem
 from app.observabilidade import abrir_turno, fechar_turno, status_do_estado
 
@@ -51,6 +52,7 @@ class Estado(MessagesState):
     rota: str
     mapa_pii: dict[str, str]
     bloqueado: bool
+    escrita_autorizada: bool
 
 
 def _texto_mensagem(mensagem: object) -> str:
@@ -126,14 +128,16 @@ def no_roteador(estado: Estado, config) -> dict:
     return {"agentes_chamados": ["roteador"], "rota": rota}
 
 
+# Financeiro e agenda devolvem também as chamadas e os retornos das tools:
+# o juiz só aprova a frase com a evidência do que a tool fez.
 def no_financeiro(estado: Estado, config) -> dict:
     saida = financeiro_agent.invoke({"messages": list(estado["messages"])}, config=config)
-    return {"agentes_chamados": ["financeiro"], "messages": [saida["messages"][-1]]}
+    return {"agentes_chamados": ["financeiro"], "messages": saida["messages"][len(estado["messages"]):]}
 
 
 def no_agenda(estado: Estado, config) -> dict:
     saida = agenda_agent.invoke({"messages": list(estado["messages"])}, config=config)
-    return {"agentes_chamados": ["agenda"], "messages": [saida["messages"][-1]]}
+    return {"agentes_chamados": ["agenda"], "messages": saida["messages"][len(estado["messages"]):]}
 
 
 def no_faq(estado: Estado, config) -> dict:
@@ -206,7 +210,7 @@ def executar_fluxo_assessor(
         "rota":             "",
         "mapa_pii":         {},
         "session_id":       session_id,
-
+        "escrita_autorizada": False,
     }
 
     # O registro abre antes do invoke e fecha no finally, inclusive quando
@@ -217,10 +221,17 @@ def executar_fluxo_assessor(
     try:
         estado_final = fluxo_agentes.invoke(
             estado_inicial,
-            config={"configurable": {"thread_id": session_id, "user_id": user_id}},
+            config={"configurable": {"thread_id": session_id, "user_id": user_id, "turno_id": turno_id}},
         )
 
         resposta = _texto_mensagem(estado_final["messages"][-1])
+
+        # Fronteira da escrita: só o veredito aprovado do juiz confirma o que
+        # as tools deixaram pendente neste turno. Recusa ou juiz sem resposta desfaz.
+        if estado_final.get("escrita_autorizada"):
+            confirmar_escritas(turno_id)
+        elif descartar_escritas(turno_id):
+            resposta = f"{resposta}\n\n{FRASE_ESCRITA_DESFEITA}"
 
         # Salva no MongoDB após cada interação
         salvar_mensagem(session_id, "human",     pergunta_usuario_anonimizado, user_id=user_id)
@@ -230,4 +241,6 @@ def executar_fluxo_assessor(
         rota = estado_final.get("rota") or ""
         return resposta, estado_final.get("agentes_chamados", [])
     finally:
+        # Exceção em qualquer ponto do turno: nada do que ficou pendente permanece.
+        descartar_escritas(turno_id)
         fechar_turno(turno_id, session_id=session_id, rota=rota, status=status)

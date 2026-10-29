@@ -68,13 +68,16 @@ def _coleta(estado):
     return pergunta, resposta, evidencia[-6000:]
 
 
-def _publicar(texto, rotulo, resposta_original):
+def _publicar(texto, rotulo, resposta_original, aprovado=False):
+    # escrita_autorizada é o veredito que a fronteira de escrita lê no fim
+    # do turno (app/escritas_pendentes.py). Só a resposta apoiada autoriza.
     print(f"[juiz] {rotulo}")
     if texto.strip() == (resposta_original or "").strip():
-        return {"agentes_chamados": [f"juiz:{rotulo}"]}
+        return {"agentes_chamados": [f"juiz:{rotulo}"], "escrita_autorizada": aprovado}
     return {
         "messages": [{"role": "assistant", "content": texto.strip()}],
         "agentes_chamados": [f"juiz:{rotulo}"],
+        "escrita_autorizada": aprovado,
     }
 
 
@@ -126,7 +129,7 @@ def _julgar_jev(pergunta, resposta, evidencia):
     choice = respostas["veredito"]["choice"]
     noul = float(respostas["apoiada"]["noul"])
     if choice == "apoiada" and noul >= LIMIAR:
-        return _publicar(resposta, f"apoiada noul={noul:.2f}", resposta)
+        return _publicar(resposta, f"apoiada noul={noul:.2f}", resposta, aprovado=True)
     rotulo = "apoiada:abaixo_do_limiar" if choice == "apoiada" else choice
     return _publicar(FRASE_SEGURA, f"{rotulo} noul={noul:.2f}", resposta)
 
